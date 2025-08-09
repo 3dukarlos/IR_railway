@@ -1,59 +1,61 @@
-from fastapi import FastAPI, Query, Response
-from fastapi.middleware.cors import CORSMiddleware
+# topo do arquivo (imports)
 import yfinance as yf
-import requests, csv, io
+import requests, csv, io, os
 
-app = FastAPI(title="FP&A Mini Backend (Railway + FastAPI)")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.get("/health")
-def health():
-    return {"ok": True, "runtime": "python", "framework": "fastapi"}
+# ... mantém FastAPI e CORS como já está ...
 
 # ---------- helpers ----------
 def stooq_symbol(sym: str) -> str:
-    # Stooq usa .sa em minúsculas para B3
-    # ex.: PTBL3.SA -> ptbl3.sa
-    s = sym.strip()
-    return s.lower()
+    return sym.strip().lower()   # ex.: PTBL3.SA -> ptbl3.sa
+
+def brapi_symbol(sym: str) -> str:
+    s = sym.strip().upper()
+    return s.replace(".SA", "")  # ex.: PTBL3.SA -> PTBL3
 
 def stooq_quote(sym: str):
-    """Retorna (price, shares, mcap) ou (None, None, None) a partir do Stooq."""
-    # Campos: s,d2,t2,o,h,l,c,v,n (c=close)
     url = f"https://stooq.com/q/l/?s={stooq_symbol(sym)}&f=sd2t2ohlcvn"
     try:
-        r = requests.get(url, timeout=12)
+        r = requests.get(url, timeout=10)
         r.raise_for_status()
-        # CSV de 1 linha
         rows = list(csv.DictReader(io.StringIO(r.text)))
-        if not rows:
-            return None, None, None
-        row = rows[0]
-        price = row.get("c")
-        price = float(price) if price not in (None, "", "N/D") else None
-        # Stooq não traz shares/mcap; deixamos None
+        if not rows: return None, None, None
+        price = rows[0].get("c")
+        price = float(price) if price and price not in ("N/D",) else None
         return price, None, None
     except Exception:
         return None, None, None
 
+def brapi_quote(sym: str):
+    """Retorna (price, shares, mcap) usando brapi.dev"""
+    base = "https://brapi.dev/api/quote"
+    t = brapi_symbol(sym)
+    token = os.getenv("BRAPI_TOKEN")  # opcional
+    url = f"{base}/{t}?range=1d&interval=1d" + (f"&token={token}" if token else "")
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        arr = data.get("results") or []
+        if not arr: return None, None, None
+        q = arr[0]
+        price = q.get("regularMarketPrice") or q.get("regularMarketPreviousClose")
+        mcap = q.get("marketCap")
+        shares = q.get("sharesOutstanding") or q.get("shares")  # às vezes vem como 'shares'
+        price = float(price) if price is not None else None
+        mcap  = float(mcap)  if mcap  is not None else None
+        shares = int(shares) if shares is not None else None
+        return price, shares, mcap
+    except Exception:
+        return None, None, None
+
 def yf_quote(sym: str):
-    """Retorna (price, shares, mcap) via yfinance (tolerante)."""
     try:
         tk = yf.Ticker(sym)
         fi = getattr(tk, "fast_info", {}) or {}
         price = fi.get("last_price") or fi.get("lastPrice")
         shares = fi.get("shares")
         mcap = fi.get("market_cap")
-
         if price is None:
-            # fallback leve
             try:
                 info = tk.info or {}
                 price = info.get("regularMarketPrice") or info.get("previousClose")
@@ -61,54 +63,67 @@ def yf_quote(sym: str):
                 mcap = mcap or info.get("marketCap")
             except Exception:
                 pass
-
-        # normaliza tipos
         price = float(price) if price is not None else None
         mcap  = float(mcap)  if mcap  is not None else None
         shares = int(shares) if shares is not None else None
         return price, shares, mcap
-    except Exception as e:
-        # devolve None e deixa o caller decidir o fallback
+    except Exception:
         return None, None, None
 
 def stooq_chart(sym: str, interval: str = "d"):
-    """Retorna lista de closes via Stooq (interval d/w/m)."""
     url = f"https://stooq.com/q/d/l/?s={stooq_symbol(sym)}&i={interval}"
     try:
-        r = requests.get(url, timeout=12)
+        r = requests.get(url, timeout=10)
         r.raise_for_status()
         reader = csv.DictReader(io.StringIO(r.text))
         closes = []
         for row in reader:
             c = row.get("Close")
             if c and c not in ("N/D",):
-                try:
-                    closes.append(float(c))
-                except Exception:
-                    pass
+                try: closes.append(float(c))
+                except: pass
+        return closes
+    except Exception:
+        return []
+
+def brapi_chart(sym: str, range_: str = "1y", interval: str = "1d"):
+    base = "https://brapi.dev/api/quote"
+    t = brapi_symbol(sym)
+    token = os.getenv("BRAPI_TOKEN")
+    url = f"{base}/{t}?range={range_}&interval={interval}" + (f"&token={token}" if token else "")
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        arr = data.get("results") or []
+        if not arr: return []
+        candles = arr[0].get("historicalDataPrice") or []
+        closes = []
+        for c in candles:
+            v = c.get("close")
+            if v is not None:
+                try: closes.append(float(v))
+                except: pass
         return closes
     except Exception:
         return []
 
 # ---------- endpoints ----------
 @app.get("/quote")
-def quote(symbols: str = Query(..., description="Comma-separated tickers, e.g. PTBL3.SA,DXCO3.SA")):
+def quote(symbols: str = Query(..., description="Comma-separated tickers e.g. PTBL3.SA,DXCO3.SA")):
     syms = [s.strip() for s in symbols.split(",") if s.strip()]
-    out = []
-    errors = []
+    out, errors = [], []
     for t in syms:
-        # 1) tenta Yahoo/yfinance
-        price, shares, mcap = yf_quote(t)
         source = "yfinance"
+        price, shares, mcap = yf_quote(t)
         if price is None:
-            # 2) fallback Stooq
-            p2, s2, m2 = stooq_quote(t)
-            if p2 is not None:
-                price, shares, mcap = p2, s2, m2
-                source = "stooq"
-            else:
-                errors.append({"symbol": t, "error": "no_data", "source": "yahoo+stooq"})
-
+            source = "stooq"
+            price, shares, mcap = stooq_quote(t)
+        if price is None:
+            source = "brapi"
+            price, shares, mcap = brapi_quote(t)
+        if price is None:
+            errors.append({"symbol": t, "error": "no_data_all_sources"})
         out.append({
             "symbol": t,
             "regularMarketPrice": price,
@@ -120,15 +135,6 @@ def quote(symbols: str = Query(..., description="Comma-separated tickers, e.g. P
 
 @app.get("/chart")
 def chart(symbol: str, range: str = "ytd", interval: str = "1d"):
-    """
-    Tenta yfinance; se falhar, usa Stooq (diário).
-    Observação: Stooq não filtra 'ytd'; devolvemos a série diária inteira e o front pode calcular YTD.
-    """
-    # Normaliza intervalo para Stooq: '1d' -> 'd', '1w' -> 'w', etc.
-    stooq_int = "d"
-    if interval.lower().startswith("w"): stooq_int = "w"
-    if interval.lower().startswith("m"): stooq_int = "m"
-
     # 1) yfinance
     try:
         hist = yf.Ticker(symbol).history(period=range, interval=interval)
@@ -137,10 +143,15 @@ def chart(symbol: str, range: str = "ytd", interval: str = "1d"):
             return {"close": close, "source": "yfinance"}
     except Exception:
         pass
-
-    # 2) stooq fallback
+    # 2) Stooq
+    stooq_int = "d" if interval.lower().startswith("1d") else ("w" if interval.lower().startswith("1w") else "m")
     close = stooq_chart(symbol, interval=stooq_int)
     if close:
         return {"close": close, "source": "stooq"}
-
-    return Response(content='{"error":"no_data"}', media_type="application/json", status_code=502)
+    # 3) Brapi
+    # mapeia 'ytd' -> '1y' para brapi (ele aceita 1d,5d,1mo,3mo,6mo,1y,5y,max)
+    br_range = "1y" if range.lower() == "ytd" else range
+    close = brapi_chart(symbol, range_=br_range, interval=interval)
+    if close:
+        return {"close": close, "source": "brapi"}
+    return Response(content='{"error":"no_data_all_sources"}', media_type="application/json", status_code=502)
