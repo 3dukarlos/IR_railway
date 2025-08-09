@@ -130,6 +130,69 @@ def stooq_chart(sym: str, interval: str = "d"):
     except Exception:
         return []
 
+# ===== Alpha Vantage: OVERVIEW + BALANCE_SHEET + GLOBAL_QUOTE =====
+def alpha_overview(sym: str):
+    """Campos de fundamentals (TTM) via Alpha: MarketCap, EBITDA, EPS, BookValue, SharesOutstanding, P/E, P/B, EV/EBITDA."""
+    if not ALPHA_KEY: return {}
+    t = to_alpha_symbol(sym)
+    key = ("alpha_overview", t)
+    c = cache_get(key)
+    if c is not None: return c
+    url = f"{ALPHA_BASE}?function=OVERVIEW&symbol={t}&apikey={ALPHA_KEY}"
+    try:
+        r = requests.get(url, timeout=12); r.raise_for_status()
+        js = r.json() or {}
+        # normaliza numéricos
+        def f(x):
+            try: return float(x)
+            except: return None
+        out = {
+            "MarketCapitalization": f(js.get("MarketCapitalization")),
+            "EBITDA": f(js.get("EBITDA")),
+            "DilutedEPSTTM": f(js.get("DilutedEPSTTM")),
+            "BookValue": f(js.get("BookValue")),           # por ação
+            "SharesOutstanding": (int(float(js.get("SharesOutstanding"))) if js.get("SharesOutstanding") not in (None,"") else None),
+            "PERatio": f(js.get("PERatio")) or f(js.get("TrailingPE")),
+            "PriceToBookRatio": f(js.get("PriceToBookRatio")),
+            "EVToEBITDA": f(js.get("EVToEBITDA")),
+        }
+        cache_set(key, out); return out
+    except Exception:
+        return {}
+
+def alpha_balance_latest(sym: str):
+    """Busca TotalDebt e Cash do último relatório (annual ou quarterly)."""
+    if not ALPHA_KEY: return {}
+    t = to_alpha_symbol(sym)
+    key = ("alpha_balance", t)
+    c = cache_get(key)
+    if c is not None: return c
+    url = f"{ALPHA_BASE}?function=BALANCE_SHEET&symbol={t}&apikey={ALPHA_KEY}"
+    try:
+        r = requests.get(url, timeout=12); r.raise_for_status()
+        js = r.json() or {}
+        rows = (js.get("quarterlyReports") or []) or (js.get("annualReports") or [])
+        def f(x):
+            try: return float(x)
+            except: return None
+        if rows:
+            last = rows[0]
+            out = {
+                "TotalDebt": f(last.get("totalDebt")),
+                "Cash": f(last.get("cashAndCashEquivalentsAtCarryingValue") or last.get("cashAndCashEquivalents")) ,
+            }
+        else:
+            out = {"TotalDebt": None, "Cash": None}
+        cache_set(key, out); return out
+    except Exception:
+        return {"TotalDebt": None, "Cash": None}
+
+def alpha_price(sym: str):
+    """Preço via GLOBAL_QUOTE (com cache)."""
+    p,_,_ = alpha_quote(sym)  # já tem cache
+    return p
+
+
 # ---------- endpoints ----------
 @app.get("/quote")
 def quote(symbols: str = Query(..., description="Comma-separated tickers e.g. PTBL3.SA,DXCO3.SA")):
@@ -180,3 +243,63 @@ def chart(symbol: str, range: str = "ytd", interval: str = "1d"):
     if closes:
         return {"close": closes, "source": "stooq"}
     return Response(content='{"error":"no_data_all_sources"}', media_type="application/json", status_code=502)
+
+@app.get("/fundamentals")
+def fundamentals(ticker: str):
+    """
+    Retorna básicos para múltiplos:
+    - price, sharesOutstanding, marketCap
+    - totalDebt, cash, netDebt, EV
+    - ebitdaTTM, epsTTM, bookValuePerShare
+    - evEbitda, pe, pb
+    source: "alpha"
+    """
+    sym = ticker.strip().upper()
+    ov = alpha_overview(sym)
+    bal = alpha_balance_latest(sym)
+    price = alpha_price(sym)
+
+    shares = ov.get("SharesOutstanding")
+    marketCap = ov.get("MarketCapitalization")
+    ebitda = ov.get("EBITDA")
+    eps = ov.get("DilutedEPSTTM")
+    bvps = ov.get("BookValue")
+    pe_av = ov.get("PERatio")
+    pb_av = ov.get("PriceToBookRatio")
+    ev_ebitda_av = ov.get("EVToEBITDA")
+
+    totalDebt = bal.get("TotalDebt")
+    cash = bal.get("Cash")
+    netDebt = (totalDebt - cash) if (totalDebt is not None and cash is not None) else None
+
+    # EV preferindo marketCap + netDebt; senão deixa None
+    ev = (marketCap + netDebt) if (marketCap is not None and netDebt is not None) else None
+
+    # Múltiplos calculados (se possível)
+    evEbitda_calc = (ev / ebitda) if (ev is not None and ebitda and ebitda > 0) else None
+    pe_calc = (price / eps) if (price is not None and eps and eps != 0) else None
+    # Book Value total = bvps * shares (se existir)
+    equityBV = (bvps * shares) if (bvps is not None and shares is not None) else None
+    pb_calc = (marketCap / equityBV) if (marketCap is not None and equityBV and equityBV > 0) else None
+
+    return {
+        "symbol": sym,
+        "source": "alpha",
+        "price": price,
+        "sharesOutstanding": shares,
+        "marketCap": marketCap,
+        "totalDebt": totalDebt,
+        "cash": cash,
+        "netDebt": netDebt,
+        "ev": ev,
+        "ebitdaTTM": ebitda,
+        "epsTTM": eps,
+        "bookValuePerShare": bvps,
+        "equityBookValue": equityBV,
+        "multiples": {
+            "evEbitda": evEbitda_calc or ev_ebitda_av,
+            "pe": pe_calc or pe_av,
+            "pb": pb_calc or pb_av
+        }
+    }
+
